@@ -1,0 +1,8 @@
+services:
+  njt-bus-bridge:
+    build: .
+    container_name: njt-bus-bridge
+    restart: unless-stopped
+    env_file: njt-bridge.env
+    ports:
+      - "8001:8000"
