@@ -31,12 +31,10 @@ WiFiClient plainClient;
 struct BusEntry {
   String route;
   String header;
-  String vehicleId; // "" when not GPS-tracked
-  String etaTime;   // "6:15 PM" - computed by the bridge from eta_min, like the app shows
+  String etaTime; // "6:15 PM" - computed by the bridge from eta_min, like the app shows
   int etaMin;
   int secLate;
-  int occupancy;    // 0 = unknown, 1..3 = light/medium/full (see bridge app.py)
-  bool realtime;    // GPS-tracked vehicle vs a schedule-based estimate
+  int occupancy;  // 0 = unknown, 1..3 = light/medium/full (see bridge app.py)
 };
 
 struct BoardState {
@@ -56,8 +54,7 @@ uint32_t wifiDownSince = 0; // 0 = currently connected (or not yet tracked)
 
 bool busEqual(const BusEntry &a, const BusEntry &b) {
   return a.route == b.route && a.header == b.header && a.etaMin == b.etaMin &&
-         a.secLate == b.secLate && a.realtime == b.realtime && a.occupancy == b.occupancy &&
-         a.vehicleId == b.vehicleId && a.etaTime == b.etaTime;
+         a.secLate == b.secLate && a.occupancy == b.occupancy && a.etaTime == b.etaTime;
 }
 
 // ---------- palette: same app layout, dark mode ----------
@@ -176,22 +173,30 @@ void drawHeader() {
   }
   tft.drawString(title, TITLE_X, 19);
 
-  uint16_t pillColor;
+  // Solid fill, not colored text/outline on the blue header - green (and
+  // to a lesser extent red) text on #004f99 blue had too little contrast
+  // to read at a glance. A filled pill contrasts strongly against the
+  // header either way, and each state gets a text color chosen to read
+  // well against ITS OWN fill.
+  uint16_t pillColor, pillTextColor;
   const char *label;
   if (WiFi.status() != WL_CONNECTED) {
     pillColor = COL_CRITICAL;
+    pillTextColor = COL_ALT_INK; // white on red
     label = "NO NET";
   } else if (board.ok) {
     pillColor = COL_GOOD;
+    pillTextColor = COL_ALT_INK; // white on green
     label = "LIVE";
   } else {
     pillColor = COL_WARNING;
+    pillTextColor = COL_PAGE; // near-black on light amber reads better than white
     label = "STALE";
   }
-  tft.drawRoundRect(PILL_X, PILL_Y, PILL_W, PILL_H, 4, pillColor);
+  tft.fillRoundRect(PILL_X, PILL_Y, PILL_W, PILL_H, 4, pillColor);
   tft.setFreeFont(NULL);
   tft.setTextSize(1);
-  tft.setTextColor(pillColor, COL_HEADER);
+  tft.setTextColor(pillTextColor, pillColor);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(label, PILL_X + PILL_W / 2, PILL_Y + PILL_H / 2);
 }
@@ -205,23 +210,21 @@ void drawPersonIcon(TFT_eSPI &g, int x, int cy, uint16_t color) {
 }
 
 // n-of-3 figures, filled (green) vs empty (grey/muted) - same on/off-count
-// convention as the app's occupancy icon. Given its own space under the
-// ETA number instead of crammed into the text line, so it's actually
-// legible - crowding is important enough info to be seen at a glance.
-void drawOccupancy(TFT_eSPI &g, int cx, int cy, int level) {
+// convention as the app's occupancy icon. Drawn big enough to actually
+// read at a glance, right in the middle column next to the arrival time.
+void drawOccupancy(TFT_eSPI &g, int leftX, int cy, int level) {
   static const int GAP = 12;
-  int startX = cx - GAP;
+  int firstCenter = leftX + 4; // icon body extends -4 from its center, so this aligns its left edge to leftX
   for (int i = 0; i < 3; i++) {
-    drawPersonIcon(g, startX + i * GAP, cy, i < level ? COL_GOOD : COL_MUTED);
+    drawPersonIcon(g, firstCenter + i * GAP, cy, i < level ? COL_GOOD : COL_MUTED);
   }
 }
 
 // TFT_eSprite derives from TFT_eSPI, so the same code renders a row either
 // into the off-screen sprite or straight to the panel as a fallback.
-// Two text lines - destination, then "Bus #### / Scheduled" + clock time -
-// not three: the app's absolute-clock-time line got folded into the
-// sub-line rather than its own row, and occupancy moved under the ETA
-// number where there's room to draw it big enough to actually read.
+// Two lines in the middle column: destination, then the arrival clock
+// time + congestion icons. Route number on the left, countdown ETA on
+// the right.
 void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   uint16_t bg = alt ? COL_ALT_BG : COL_PAGE;
   uint16_t ink = alt ? COL_ALT_INK : COL_INK;
@@ -246,19 +249,19 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   }
   g.drawString(dest, DEST_X, destY);
 
-  // Sub-line: vehicle # (or "Scheduled") + the arrival clock time - same
-  // font as the destination, not the tiny stock font, so it's readable.
+  // Sub-line: just the arrival clock time (no vehicle #) + congestion
+  // icons right after it, both in the middle column.
   g.setFreeFont(&FreeSans9pt7b);
   g.setTextColor(ink, bg);
   g.setTextDatum(ML_DATUM);
-  String subLine = bus.realtime ? ("Bus #" + bus.vehicleId) : "Scheduled";
-  if (bus.etaTime.length()) {
-    subLine += "  " + bus.etaTime;
-  }
+  String subLine = bus.etaTime;
   while (subLine.length() > 0 && g.textWidth(subLine) > DEST_MAX_W) {
     subLine = subLine.substring(0, subLine.length() - 1);
   }
   g.drawString(subLine, DEST_X, subY);
+  if (bus.occupancy > 0) {
+    drawOccupancy(g, DEST_X + g.textWidth(subLine) + 14, subY, bus.occupancy);
+  }
 
   // ETA, right-aligned and vertically centered on the whole row.
   char etaBuf[10];
@@ -273,10 +276,6 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   g.setTextColor(statusColor(bus.secLate, ink), bg);
   g.setTextDatum(MR_DATUM);
   g.drawString(etaBuf, ETA_RIGHT, cy);
-
-  if (bus.occupancy > 0) {
-    drawOccupancy(g, ETA_RIGHT - ETA_COL_W / 2, cy + 20, bus.occupancy);
-  }
 }
 
 void drawBusRow(int rowY, const BusEntry &bus, bool alt) {
@@ -410,8 +409,6 @@ bool fetchStats() {
     entry.header = String((const char *)(b["header"] | ""));
     entry.etaMin = b["eta_min"] | 0;
     entry.secLate = b["sec_late"] | 0;
-    entry.realtime = b["realtime"] | true;
-    entry.vehicleId = String((const char *)(b["vehicle_id"] | ""));
     entry.etaTime = String((const char *)(b["eta_time"] | ""));
     entry.occupancy = b["occupancy"] | 0;
     board.busCount++;
