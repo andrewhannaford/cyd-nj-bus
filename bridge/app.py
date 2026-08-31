@@ -1,26 +1,29 @@
 """
-NJ Transit bus arrivals bridge: polls NJT's Bus Data Exchange
-(getNextTripsXML) for one or more stop IDs and serves a small JSON
+NJ Transit bus arrivals bridge: scrapes NJT's public MyBus site
+(mybusnow.njtransit.com) for one or more stop IDs and serves a small JSON
 snapshot for the CYD firmware to poll.
 
+Uses the same unauthenticated "wireless" (text-only) rider-facing pages
+the mobile site itself uses - no developer API key required. NJT could
+change this markup at any time; switch back to getNextTripsXML (see git
+history) once a developer account is approved.
+
 Config comes from environment variables (see njt-bridge.env.example):
-  NJT_USERNAME, NJT_PASSWORD, STOP_IDS, POLL_INTERVAL, PORT
+  STOP_IDS, POLL_INTERVAL, PORT
 
 Data provided by NJ TRANSIT, sole owner of the data. This app is not
 endorsed by, affiliated with, or sponsored by NJ TRANSIT.
 """
 import os
+import re
 import threading
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify
 
-NJT_USERNAME = os.environ["NJT_USERNAME"]
-NJT_PASSWORD = os.environ["NJT_PASSWORD"]
 # A physical stop pole gets its own stop_id per direction - list more than
 # one to merge both directions (or multiple nearby poles) into one board.
 STOP_IDS = [s.strip() for s in os.environ["STOP_IDS"].split(",") if s.strip()]
@@ -28,55 +31,113 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 PORT = int(os.environ.get("PORT", "8000"))
 NJT_TIMEOUT_S = 10
 
-BUS_DATA_URL = "https://busdata.njtransit.com/NJTBusData.asmx/getNextTripsXML"
-TZ = ZoneInfo("America/New_York")  # NJT times have no date/offset - assume Eastern regardless of host TZ
+MYBUS_HOME_URL = "https://mybusnow.njtransit.com/bustime/wireless/html/home.jsp"
+MYBUS_ETA_URL = "https://mybusnow.njtransit.com/bustime/wireless/html/eta.jsp"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+TZ = ZoneInfo("America/New_York")
+
+# Each prediction block on eta.jsp looks like:
+#   <strong class="larger">#158&nbsp;</strong> ... To ... 158 NEW YORK VIA RIVER ROAD
+#   ... <strong class="larger">7&nbsp;MIN</strong>  (or "DELAYED", or "&lt; 1 MIN")
+#   <span class="smaller"> ... (Vehicle 20872) ... (Passengers: Light) </span>
+# The (Vehicle #) line only appears when a real bus is actively GPS-tracked
+# for that trip; its absence is NJT's own signal for a schedule-based
+# estimate with no live vehicle assigned yet (there's no separate flag).
+BLOCK_RE = re.compile(
+    r'<strong class="larger">#(?P<route>\S+?)&nbsp;</strong>.*?'
+    r'To\s*(?P<dest>.*?)\s*'
+    r'<strong class="larger">(?P<eta>.*?)</strong>'
+    r'(?P<tail>.*?)(?=<hr)',
+    re.S,
+)
+STOP_NAME_RE = re.compile(r"Selected Stop:\s*(.+?)\s*<")
+VEHICLE_RE = re.compile(r"\(Vehicle\s*(\d+)\)")
+PASSENGERS_RE = re.compile(r"\(Passengers:\s*([^)]+)\)")
+DELAYED_SEC_LATE = 300  # scrape only gives a boolean "DELAYED" flag, no seconds - pin it past the firmware's critical threshold
+
+# NJT's own app shows a 3-figure occupancy icon (n of 3 filled); the wireless
+# page only gives a text label, and only when a vehicle happens to report
+# one, so this is a best-effort mapping onto the same 3-level scale.
+def _occupancy_level(tail):
+    m = PASSENGERS_RE.search(tail)
+    if not m:
+        return 0
+    label = m.group(1).strip().lower()
+    if "full" in label or "crowd" in label or "heavy" in label:
+        return 3
+    if "medium" in label or "moderate" in label:
+        return 2
+    if "light" in label or "empty" in label:
+        return 1
+    return 0
 
 app = Flask(__name__)
 _state_lock = threading.Lock()
 _state = {"ok": False, "error": "not polled yet"}
-
-
-def _parse_departure(time_str, now):
-    # NJT gives "HH:MM:SS" with no date - anchor to today, then roll forward
-    # a day if that lands more than a few minutes in the past (next-trip
-    # queries near midnight can return times that are technically tomorrow).
-    hh, mm, ss = (int(p) for p in time_str.split(":"))
-    dt = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-    if dt < now - timedelta(minutes=5):
-        dt += timedelta(days=1)
-    return dt
+_session = requests.Session()
+_session.headers["User-Agent"] = USER_AGENT
 
 
 def _fetch_stop(stop_id, now):
-    resp = requests.post(
-        BUS_DATA_URL,
-        data={"username": NJT_USERNAME, "password": NJT_PASSWORD, "stopid": stop_id},
-        timeout=NJT_TIMEOUT_S,
-    )
+    # eta.jsp 500s without a valid session cookie (from Cloudflare's bot
+    # check) - re-warm the session and retry once before giving up.
+    for attempt in range(2):
+        resp = _session.get(
+            MYBUS_ETA_URL,
+            params={
+                "route": "---",
+                "direction": "---",
+                "displaydirection": "---",
+                "stop": "---",
+                "findstop": "on",
+                "selectedRtpiFeeds": "",
+                "id": stop_id,
+            },
+            timeout=NJT_TIMEOUT_S,
+        )
+        if resp.ok and "Error processing request" not in resp.text:
+            break
+        _session.get(MYBUS_HOME_URL, timeout=NJT_TIMEOUT_S)
     resp.raise_for_status()
-    root = ET.fromstring(resp.content)
+    html = resp.text
+
+    stop_name = None
+    m = STOP_NAME_RE.search(html)
+    if m:
+        stop_name = m.group(1).strip()
 
     buses = []
-    stop_name = None
-    for trip in root.iter("Trip"):
-        dep_str = (trip.findtext("departure_time") or "").strip()
-        if not dep_str:
-            continue
-        dep_dt = _parse_departure(dep_str, now)
-        sec_late_raw = (trip.findtext("sec_late") or "0").strip()
-        try:
-            sec_late = int(sec_late_raw)
-        except ValueError:
-            sec_late = 0
-        name = (trip.findtext("stop_name") or "").strip()
-        if name:
-            stop_name = name
+    for m in BLOCK_RE.finditer(html):
+        eta_raw = m.group("eta").replace("&nbsp;", " ").strip()
+        route = m.group("route").strip()
+        dest = re.sub(r"\s+", " ", m.group("dest").replace("&nbsp;", " ")).strip()
+        # "158 NEW YORK VIA RIVER ROAD" -> "NEW YORK VIA RIVER ROAD"; the board
+        # shows the route on its own badge, so the prefix just eats width.
+        dest = re.sub(r"^" + re.escape(route) + r"[A-Z]?\s+", "", dest)
+        tail = m.group("tail")
+        delayed = eta_raw.upper() == "DELAYED"
+        digits = re.search(r"\d+", eta_raw)
+        eta_min = int(digits.group()) if digits else -1
+
+        vehicle_m = VEHICLE_RE.search(tail)
+        # Absolute clock time, like the app's "6:01 PM" - not on this page at
+        # all, so it's derived the same way a countdown implies a clock time.
+        eta_time = None
+        if eta_min >= 0:
+            # %-I (no leading zero) is a glibc extension, not portable -
+            # format normally and strip a leading zero instead.
+            eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
+
         buses.append(
             {
-                "route": (trip.findtext("route") or "?").strip(),
-                "header": (trip.findtext("header") or "").strip(),
-                "eta_min": max(0, round((dep_dt - now).total_seconds() / 60)),
-                "sec_late": sec_late,
+                "route": route,
+                "header": dest,
+                "eta_min": eta_min,
+                "eta_time": eta_time,
+                "sec_late": DELAYED_SEC_LATE if delayed else 0,
+                "realtime": vehicle_m is not None,
+                "vehicle_id": vehicle_m.group(1) if vehicle_m else None,
+                "occupancy": _occupancy_level(tail),
             }
         )
     return stop_name, buses
@@ -91,7 +152,7 @@ def _poll_once():
         stop_name = stop_name or name
         all_buses.extend(buses)
 
-    all_buses.sort(key=lambda b: b["eta_min"])
+    all_buses.sort(key=lambda b: b["eta_min"] if b["eta_min"] >= 0 else 10**9)
 
     new_state = {
         "ok": True,

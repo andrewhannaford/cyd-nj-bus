@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
 firmware/.pio/
-firmware/src/secrets.h
 bridge/njt-bridge.env
 .DS_Store
