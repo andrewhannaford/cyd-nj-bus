@@ -47,7 +47,7 @@ BLOCK_RE = re.compile(
     r'<strong class="larger">#(?P<route>\S+?)&nbsp;</strong>.*?'
     r'To\s*(?P<dest>.*?)\s*'
     r'<strong class="larger">(?P<eta>.*?)</strong>'
-    r'(?P<tail>.*?)(?=<hr)',
+    r'(?P<tail>.*?)(?=<hr|$)',  # fall back to end-of-string if a trailing <hr is ever missing
     re.S,
 )
 STOP_NAME_RE = re.compile(r"Selected Stop:\s*(.+?)\s*<")
@@ -101,10 +101,15 @@ def _fetch_stop(stop_id, now):
     resp.raise_for_status()
     html = resp.text
 
-    stop_name = None
     m = STOP_NAME_RE.search(html)
-    if m:
-        stop_name = m.group(1).strip()
+    if not m:
+        # A 200 with no "Selected Stop:" marker means the page didn't render
+        # as expected (a different soft failure than the 500/challenge case
+        # already retried above) - raise instead of silently reporting
+        # ok=True with zero buses, which would look like "no buses" to the
+        # firmware rather than "the scrape broke."
+        raise RuntimeError(f"stop {stop_id}: unexpected page, no stop name found")
+    stop_name = m.group(1).strip()
 
     buses = []
     for m in BLOCK_RE.finditer(html):
@@ -117,7 +122,12 @@ def _fetch_stop(stop_id, now):
         tail = m.group("tail")
         delayed = eta_raw.upper() == "DELAYED"
         digits = re.search(r"\d+", eta_raw)
-        eta_min = int(digits.group()) if digits else -1
+        if digits:
+            eta_min = int(digits.group())
+        elif delayed:
+            eta_min = -1  # sentinel the firmware renders as "Delayed"
+        else:
+            eta_min = 0  # e.g. a digit-less "DUE" - imminent, not delayed
 
         vehicle_m = VEHICLE_RE.search(tail)
         # Absolute clock time, like the app's "6:01 PM" - not on this page at
@@ -144,13 +154,22 @@ def _fetch_stop(stop_id, now):
 
 
 def _poll_once():
-    now = datetime.now(TZ)
     all_buses = []
     stop_name = None
+    errors = []
+    # Each stop is independent - one down direction failing shouldn't take
+    # the whole board (including the OTHER direction's good data) with it.
     for stop_id in STOP_IDS:
-        name, buses = _fetch_stop(stop_id, now)
+        try:
+            name, buses = _fetch_stop(stop_id, datetime.now(TZ))
+        except Exception as exc:
+            errors.append(f"{stop_id}: {exc}")
+            continue
         stop_name = stop_name or name
         all_buses.extend(buses)
+
+    if not all_buses and errors:
+        raise RuntimeError("; ".join(errors))
 
     all_buses.sort(key=lambda b: b["eta_min"] if b["eta_min"] >= 0 else 10**9)
 
@@ -160,6 +179,8 @@ def _poll_once():
         "stop_name": stop_name or "",
         "buses": all_buses[:8],
     }
+    if errors:  # partial success - some stops failed, but at least one had data
+        new_state["error"] = "; ".join(errors)
     with _state_lock:
         _state.clear()
         _state.update(new_state)
@@ -184,4 +205,6 @@ def stats():
 
 if __name__ == "__main__":
     threading.Thread(target=_poll_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    # threaded=True: unauthenticated and reachable from the public internet,
+    # with multiple gift units polling it - don't serialize their requests.
+    app.run(host="0.0.0.0", port=PORT, threaded=True)

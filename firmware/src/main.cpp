@@ -16,6 +16,7 @@
 
 static const uint32_t POLL_INTERVAL_MS = 20000;
 static const uint32_t WIFI_RETRY_MS = 15000; // give WiFi.begin() time to resolve before retrying
+static const uint32_t WIFI_PORTAL_RETRY_MS = 10UL * 60 * 1000; // reopen the setup portal after this long fully disconnected
 static const int MAX_BUSES = 3; // taller rows - the app's 3-line-per-row layout needs the room
 
 TFT_eSPI tft = TFT_eSPI();
@@ -30,8 +31,8 @@ WiFiClient plainClient;
 struct BusEntry {
   String route;
   String header;
-  String etaTime;   // "6:15 PM" - computed by the bridge from eta_min, like the app shows
   String vehicleId; // "" when not GPS-tracked
+  String etaTime;   // "6:15 PM" - computed by the bridge from eta_min, like the app shows
   int etaMin;
   int secLate;
   int occupancy;    // 0 = unknown, 1..3 = light/medium/full (see bridge app.py)
@@ -51,11 +52,12 @@ bool lastDrawnWifiConnected = false;
 
 uint32_t lastPoll = 0;
 uint32_t lastWifiAttempt = 0;
+uint32_t wifiDownSince = 0; // 0 = currently connected (or not yet tracked)
 
 bool busEqual(const BusEntry &a, const BusEntry &b) {
   return a.route == b.route && a.header == b.header && a.etaMin == b.etaMin &&
-         a.secLate == b.secLate && a.realtime == b.realtime &&
-         a.etaTime == b.etaTime && a.vehicleId == b.vehicleId && a.occupancy == b.occupancy;
+         a.secLate == b.secLate && a.realtime == b.realtime && a.occupancy == b.occupancy &&
+         a.vehicleId == b.vehicleId && a.etaTime == b.etaTime;
 }
 
 // ---------- palette: same app layout, dark mode ----------
@@ -70,8 +72,7 @@ bool busEqual(const BusEntry &a, const BusEntry &b) {
 #define COL_MUTED    0x8C30  // #898781 - muted text (header eyebrow only)
 #define COL_WARNING  0xFD83  // #fab219 - a few minutes late
 #define COL_CRITICAL 0xD1C7  // #d03b3b - significantly late / delayed
-#define COL_OCC_ON   0x0540  // #00aa00 - occupancy: filled figure
-#define COL_OCC_OFF  0xBDF7  // #bdbdbd - occupancy: empty figure
+#define COL_GOOD     0x0540  // #00aa00 - "LIVE" status pill (sampled from the app's occupancy green)
 
 // ---------- layout ----------
 static const int SCREEN_W = 320;
@@ -87,7 +88,6 @@ static const int DEST_X = ROUTE_X + ROUTE_COL_W + 10;
 static const int ETA_COL_W = 76; // reserved width for "Delayed"/"99 min" on the right
 static const int ETA_RIGHT = SCREEN_W - 10;
 static const int DEST_MAX_W = (ETA_RIGHT - ETA_COL_W) - DEST_X - 6;
-static const int OCC_DOT_GAP = 8; // spacing between the 3 occupancy figures
 
 static const int TITLE_X = 10;
 static const int PILL_W = 62;
@@ -129,11 +129,17 @@ void drawSetupMessage() {
 // from their phone without ever telling us the password. Once WiFi.begin()
 // has succeeded here once, ESP32 persists the credentials in NVS, so this
 // call returns almost immediately on every later boot.
+// Fires the instant WiFiManager actually opens the AP+portal - whether
+// this is a fresh device (no saved SSID) or saved credentials just failed
+// (neighbor's router changed) - so the setup screen always reflects real
+// device state instead of only showing on the first-boot case.
+void onConfigPortalStart(WiFiManager *wm) {
+  drawSetupMessage();
+}
+
 void connectWifi() {
   WiFi.mode(WIFI_STA);
-  if (WiFi.SSID().length() == 0) {
-    drawSetupMessage();
-  }
+  wifiManager.setAPCallback(onConfigPortalStart);
   wifiManager.setConfigPortalTimeout(180);
   wifiManager.autoConnect("NJ-Bus-Setup");
 }
@@ -176,7 +182,7 @@ void drawHeader() {
     pillColor = COL_CRITICAL;
     label = "NO NET";
   } else if (board.ok) {
-    pillColor = COL_OCC_ON; // reuse the app's occupancy green for "good"
+    pillColor = COL_GOOD;
     label = "LIVE";
   } else {
     pillColor = COL_WARNING;
@@ -190,36 +196,39 @@ void drawHeader() {
   tft.drawString(label, PILL_X + PILL_W / 2, PILL_Y + PILL_H / 2);
 }
 
-// Tiny person silhouette: round head + tapered body, built from primitives
-// since there's no icon font available. x is the icon's horizontal center,
-// cy roughly its vertical center.
+// Person silhouette: round head + tapered body, built from primitives
+// since there's no icon font available. Bigger than the first attempt -
+// too small to read at a glance was the whole problem last time.
 void drawPersonIcon(TFT_eSPI &g, int x, int cy, uint16_t color) {
-  g.fillCircle(x, cy - 3, 2, color);
-  g.fillTriangle(x - 3, cy + 4, x + 3, cy + 4, x, cy - 1, color);
+  g.fillCircle(x, cy - 4, 3, color);
+  g.fillTriangle(x - 4, cy + 5, x + 4, cy + 5, x, cy - 1, color);
 }
 
-// n-of-3 figures, filled (green) vs empty (grey) - same on/off-count
-// convention as the app's occupancy icon.
-void drawOccupancy(TFT_eSPI &g, int x, int cy, int level) {
+// n-of-3 figures, filled (green) vs empty (grey/muted) - same on/off-count
+// convention as the app's occupancy icon. Given its own space under the
+// ETA number instead of crammed into the text line, so it's actually
+// legible - crowding is important enough info to be seen at a glance.
+void drawOccupancy(TFT_eSPI &g, int cx, int cy, int level) {
+  static const int GAP = 12;
+  int startX = cx - GAP;
   for (int i = 0; i < 3; i++) {
-    int iconX = x + i * OCC_DOT_GAP;
-    drawPersonIcon(g, iconX, cy, i < level ? COL_OCC_ON : COL_OCC_OFF);
+    drawPersonIcon(g, startX + i * GAP, cy, i < level ? COL_GOOD : COL_MUTED);
   }
 }
 
 // TFT_eSprite derives from TFT_eSPI, so the same code renders a row either
 // into the off-screen sprite or straight to the panel as a fallback.
-// Direct replica of the app's row: alternating white/navy background,
-// route number plain bold on the left, destination + "Bus #### / time"
-// stacked in the middle, big ETA on the right - no extra chrome.
+// Two text lines - destination, then "Bus #### / Scheduled" + clock time -
+// not three: the app's absolute-clock-time line got folded into the
+// sub-line rather than its own row, and occupancy moved under the ETA
+// number where there's room to draw it big enough to actually read.
 void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   uint16_t bg = alt ? COL_ALT_BG : COL_PAGE;
   uint16_t ink = alt ? COL_ALT_INK : COL_INK;
   g.fillRect(0, top, SCREEN_W, ROW_H, bg);
 
-  int destY = top + 18;
-  int subY = top + 38;
-  int timeY = top + 54;
+  int destY = top + 22;
+  int subY = top + 46;
   int cy = top + ROW_H / 2;
 
   // Route number: plain bold text, no badge box - matches the app.
@@ -237,23 +246,19 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   }
   g.drawString(dest, DEST_X, destY);
 
-  // Sub-line: vehicle # (or "Scheduled") + occupancy dots, same as the
-  // app's second line under the destination.
-  g.setFreeFont(NULL);
-  g.setTextSize(1);
+  // Sub-line: vehicle # (or "Scheduled") + the arrival clock time - same
+  // font as the destination, not the tiny stock font, so it's readable.
+  g.setFreeFont(&FreeSans9pt7b);
   g.setTextColor(ink, bg);
   g.setTextDatum(ML_DATUM);
   String subLine = bus.realtime ? ("Bus #" + bus.vehicleId) : "Scheduled";
-  g.drawString(subLine, DEST_X, subY);
-  if (bus.occupancy > 0) {
-    drawOccupancy(g, DEST_X + g.textWidth(subLine) + 10, subY, bus.occupancy);
-  }
-
-  // Third line: the arrival clock time, same as the app's own third line.
   if (bus.etaTime.length()) {
-    g.setTextColor(ink, bg);
-    g.drawString(bus.etaTime, DEST_X, timeY);
+    subLine += "  " + bus.etaTime;
   }
+  while (subLine.length() > 0 && g.textWidth(subLine) > DEST_MAX_W) {
+    subLine = subLine.substring(0, subLine.length() - 1);
+  }
+  g.drawString(subLine, DEST_X, subY);
 
   // ETA, right-aligned and vertically centered on the whole row.
   char etaBuf[10];
@@ -268,6 +273,10 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   g.setTextColor(statusColor(bus.secLate, ink), bg);
   g.setTextDatum(MR_DATUM);
   g.drawString(etaBuf, ETA_RIGHT, cy);
+
+  if (bus.occupancy > 0) {
+    drawOccupancy(g, ETA_RIGHT - ETA_COL_W / 2, cy + 20, bus.occupancy);
+  }
 }
 
 void drawBusRow(int rowY, const BusEntry &bus, bool alt) {
@@ -279,8 +288,10 @@ void drawBusRow(int rowY, const BusEntry &bus, bool alt) {
   }
 }
 
-void clearRow(int rowY, bool alt) {
-  tft.fillRect(0, rowY, SCREEN_W, ROW_H, alt ? COL_ALT_BG : COL_PAGE);
+// Always plain background, never the alt stripe - zebra striping is only
+// for rows that actually have a bus in them.
+void clearRow(int rowY) {
+  tft.fillRect(0, rowY, SCREEN_W, ROW_H, COL_PAGE);
 }
 
 void drawEmptyMessage() {
@@ -289,7 +300,7 @@ void drawEmptyMessage() {
   tft.setFreeFont(&FreeSansBold12pt7b);
   tft.setTextColor(COL_MUTED, COL_PAGE);
   tft.setTextDatum(MC_DATUM);
-  const char *msg = board.ok ? "NO DEPARTURES" : "ACQUIRING FEED";
+  const char *msg = board.ok ? "NO DEPARTURES" : "LOADING BUS TIMES...";
   tft.drawString(msg, SCREEN_W / 2, cy);
 }
 
@@ -309,8 +320,11 @@ void updateDisplay(bool forceFull) {
     drawHeader();
   }
 
-  bool wasEmpty = !lastDrawnBoard.ok || lastDrawnBoard.busCount == 0;
-  bool isEmpty = !board.ok || board.busCount == 0;
+  // Empty is about whether there's any bus to show, NOT freshness - stale
+  // data (ok=false, busCount>0) still renders as rows, just with the
+  // header pill going STALE, rather than blanking to the message.
+  bool wasEmpty = lastDrawnBoard.busCount == 0;
+  bool isEmpty = board.busCount == 0;
 
   if (isEmpty) {
     // Redraw the message if the content area might still show stale rows,
@@ -321,10 +335,16 @@ void updateDisplay(bool forceFull) {
   } else {
     if (forceFull || wasEmpty) {
       // Coming from the message state (or first paint): paint every row
-      // fresh (each renderRow() fills its own zebra background, so no
-      // separate whole-area clear is needed first).
-      for (int i = 0; i < board.busCount; i++) {
-        drawBusRow(HEADER_H + i * ROW_H, board.buses[i], i % 2 == 1);
+      // fresh, AND blank any trailing slots with no bus in them - the
+      // message painted the whole content area, so leftover slots here
+      // would otherwise still show its stale text.
+      for (int i = 0; i < MAX_BUSES; i++) {
+        int rowY = HEADER_H + i * ROW_H;
+        if (i < board.busCount) {
+          drawBusRow(rowY, board.buses[i], i % 2 == 1);
+        } else {
+          clearRow(rowY);
+        }
       }
     } else {
       int maxRows = max(board.busCount, lastDrawnBoard.busCount);
@@ -338,7 +358,7 @@ void updateDisplay(bool forceFull) {
           }
         } else {
           // Fewer buses than last frame - blank the now-unused trailing row.
-          clearRow(rowY, alt);
+          clearRow(rowY);
         }
       }
     }
@@ -378,7 +398,7 @@ bool fetchStats() {
   board.ok = doc["ok"] | false;
   // Even on a transient scrape error the bridge still serves the last-good
   // buses array (see app.py) - keep showing it (header pill goes STALE)
-  // instead of blanking the whole board to "ACQUIRING FEED".
+  // instead of blanking the whole board to the loading message.
   board.stopName = String((const char *)(doc["stop_name"] | ""));
 
   JsonArray busArr = doc["buses"];
@@ -391,8 +411,8 @@ bool fetchStats() {
     entry.etaMin = b["eta_min"] | 0;
     entry.secLate = b["sec_late"] | 0;
     entry.realtime = b["realtime"] | true;
-    entry.etaTime = String((const char *)(b["eta_time"] | ""));
     entry.vehicleId = String((const char *)(b["vehicle_id"] | ""));
+    entry.etaTime = String((const char *)(b["eta_time"] | ""));
     entry.occupancy = b["occupancy"] | 0;
     board.busCount++;
   }
@@ -415,12 +435,23 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  if (WiFi.status() != WL_CONNECTED && now - lastWifiAttempt > WIFI_RETRY_MS) {
-    lastWifiAttempt = now;
-    // Reconnect with the saved credentials - NOT connectWifi(), which would
-    // reopen the blocking captive portal on every transient drop (e.g. the
-    // neighbor's router rebooting).
-    WiFi.reconnect();
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiDownSince == 0) wifiDownSince = now;
+    if (now - wifiDownSince > WIFI_PORTAL_RETRY_MS) {
+      // Down long enough that a quick reconnect clearly isn't going to fix
+      // it (saved WiFi likely gone for good, not just a router reboot) -
+      // fall back to the full portal-capable path instead of retrying
+      // WiFi.reconnect() forever with no way out.
+      wifiDownSince = now;
+      connectWifi();
+    } else if (now - lastWifiAttempt > WIFI_RETRY_MS) {
+      lastWifiAttempt = now;
+      // Reconnect with the saved credentials - NOT connectWifi(), which
+      // would reopen the blocking captive portal on every transient drop.
+      WiFi.reconnect();
+    }
+  } else {
+    wifiDownSince = 0;
   }
 
   if (now - lastPoll > POLL_INTERVAL_MS || lastPoll == 0) {
