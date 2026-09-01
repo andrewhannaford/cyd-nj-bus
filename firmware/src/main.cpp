@@ -14,7 +14,7 @@
 #error "BRIDGE_URL not set - build with the 'lan' or 'public' PlatformIO environment (see platformio.ini)"
 #endif
 
-static const uint32_t POLL_INTERVAL_MS = 20000;
+static const uint32_t POLL_INTERVAL_MS = 10000; // just our own bridge's tiny JSON - cheap to poll tighter than the bridge's own upstream refresh
 static const uint32_t WIFI_RETRY_MS = 15000; // give WiFi.begin() time to resolve before retrying
 static const uint32_t WIFI_PORTAL_RETRY_MS = 10UL * 60 * 1000; // reopen the setup portal after this long fully disconnected
 static const int MAX_BUSES = 3; // taller rows - the app's 3-line-per-row layout needs the room
