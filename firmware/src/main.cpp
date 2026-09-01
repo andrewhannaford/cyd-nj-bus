@@ -211,14 +211,17 @@ void drawPersonIcon(TFT_eSPI &g, int x, int cy, uint16_t color) {
   g.fillTriangle(x - 4, cy + 5, x + 4, cy + 5, x, cy - 1, color);
 }
 
-// n-of-3 figures, filled (green) vs empty (grey/muted) - same on/off-count
+// n-of-3 figures, filled vs empty (grey/muted) - same on/off-count
 // convention as the app's occupancy icon. Drawn big enough to actually
 // read at a glance, right in the middle column next to the arrival time.
+// Fill color scales with severity: green (low) -> yellow (medium) -> red
+// (full/heavy), same palette as the lateness color-coding.
 void drawOccupancy(TFT_eSPI &g, int leftX, int cy, int level) {
   static const int GAP = 12;
+  uint16_t fillColor = level >= 3 ? COL_CRITICAL : (level == 2 ? COL_WARNING : COL_GOOD);
   int firstCenter = leftX + 4; // icon body extends -4 from its center, so this aligns its left edge to leftX
   for (int i = 0; i < 3; i++) {
-    drawPersonIcon(g, firstCenter + i * GAP, cy, i < level ? COL_GOOD : COL_MUTED);
+    drawPersonIcon(g, firstCenter + i * GAP, cy, i < level ? fillColor : COL_MUTED);
   }
 }
 

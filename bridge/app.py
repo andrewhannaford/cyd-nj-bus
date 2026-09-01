@@ -81,6 +81,21 @@ def _occupancy_level(passload):
     return 0
 
 
+# GTFS-RT VehiclePosition.OccupancyStatus enum (gtfs-realtime.proto) -> our
+# 3-level scale. BUSDV2's passload is essentially never populated in
+# practice (always "no data"/"EMPTY" observed); this is the real source.
+_OCCUPANCY_STATUS_LEVEL = {
+    0: 1,  # EMPTY
+    1: 1,  # MANY_SEATS_AVAILABLE
+    2: 2,  # FEW_SEATS_AVAILABLE
+    3: 3,  # STANDING_ROOM_ONLY
+    4: 3,  # CRUSHED_STANDING_ROOM_ONLY
+    5: 3,  # FULL
+    6: 3,  # NOT_ACCEPTING_PASSENGERS
+    # 7 NO_DATA_AVAILABLE, 8 NOT_BOARDABLE - no usable reading, fall through
+}
+
+
 app = Flask(__name__)
 _state_lock = threading.Lock()
 _state = {"ok": False, "error": "not polled yet"}
@@ -222,7 +237,29 @@ def _fetch_realtime_updates():
     return by_stop
 
 
-def _fetch_stop(stop_id, now, rt_updates):
+def _fetch_vehicle_occupancy():
+    """trip_id -> our 1-3 occupancy level, from GTFS-RT's VehiclePositions
+    feed. System-wide (not stop-scoped) - trip_id is the join key against
+    whatever _fetch_stop already has, same as trip updates.
+    """
+    content = _gtfsg2("getVehiclePositions", timeout=GTFSRT_TIMEOUT_S, binary=True)
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(content)
+
+    levels = {}
+    for entity in feed.entity:
+        if not entity.HasField("vehicle"):
+            continue
+        v = entity.vehicle
+        if not v.HasField("occupancy_status"):
+            continue
+        level = _OCCUPANCY_STATUS_LEVEL.get(v.occupancy_status)
+        if level is not None and v.trip.trip_id:
+            levels[v.trip.trip_id] = level
+    return levels
+
+
+def _fetch_stop(stop_id, now, rt_updates, vehicle_occupancy):
     stop_name = _get_stop_name(stop_id)
     data = _busdv2("getBusDV", stop=stop_id, direction="", route="", IP="")
     trips = data.get("DVTrip") or []
@@ -297,6 +334,10 @@ def _fetch_stop(stop_id, now, rt_updates):
         else:
             eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
 
+        trip_id = _sentinel(trip.get("internal_trip_number"))
+        # GTFS-RT VehiclePositions has real crowding data; BUSDV2's passload
+        # is essentially never populated in practice, so it's just a fallback.
+        occupancy = vehicle_occupancy.get(trip_id) or _occupancy_level(trip.get("passload"))
         bus = {
             "route": route,
             "header": dest,
@@ -305,9 +346,8 @@ def _fetch_stop(stop_id, now, rt_updates):
             "sec_late": DELAYED_SEC_LATE if delayed else 0,
             "realtime": live_tracked,
             "vehicle_id": vehicle_id,
-            "occupancy": _occupancy_level(trip.get("passload")),
+            "occupancy": occupancy,
         }
-        trip_id = _sentinel(trip.get("internal_trip_number"))
         buses_by_trip[trip_id or id(trip)] = bus
 
     # GTFS-RT overrides eta/delay for trips BUSDV2 already knows about (it's
@@ -344,7 +384,7 @@ def _fetch_stop(stop_id, now, rt_updates):
             "sec_late": rt["sec_late"],
             "realtime": True,
             "vehicle_id": None,
-            "occupancy": 1,
+            "occupancy": vehicle_occupancy.get(trip_id, 1),
         }
 
     # Schedule-only trips (no live vehicle/prediction) stay on the board -
@@ -366,6 +406,12 @@ def _poll_once():
         # Not fatal - BUSDV2 alone still gives a usable, if less complete, board.
         print(f"[gtfs-rt] fetch failed, falling back to BUSDV2-only: {exc}", flush=True)
         rt_by_stop = {}
+    try:
+        vehicle_occupancy = _fetch_vehicle_occupancy()
+    except Exception as exc:
+        # Not fatal - occupancy just falls back to the default/BUSDV2 value.
+        print(f"[gtfs-rt] vehicle positions fetch failed: {exc}", flush=True)
+        vehicle_occupancy = {}
 
     all_buses = []
     stop_name = None
@@ -374,7 +420,7 @@ def _poll_once():
     # the whole board (including the OTHER direction's good data) with it.
     for stop_id in STOP_IDS:
         try:
-            name, buses = _fetch_stop(stop_id, now, rt_by_stop.get(stop_id, {}))
+            name, buses = _fetch_stop(stop_id, now, rt_by_stop.get(stop_id, {}), vehicle_occupancy)
         except Exception as exc:
             errors.append(f"{stop_id}: {exc}")
             continue
