@@ -70,7 +70,7 @@ def _sentinel(value):
 def _occupancy_level(passload):
     passload = _sentinel(passload)
     if not passload:
-        return 1  # no data reported - default to low so the icon always shows
+        return 0  # no data reported - firmware skips the icon entirely for 0
     label = passload.strip().lower()
     if "full" in label or "crowd" in label or "heavy" in label:
         return 3
@@ -384,7 +384,7 @@ def _fetch_stop(stop_id, now, rt_updates, vehicle_occupancy):
             "sec_late": rt["sec_late"],
             "realtime": True,
             "vehicle_id": None,
-            "occupancy": vehicle_occupancy.get(trip_id, 1),
+            "occupancy": vehicle_occupancy.get(trip_id, 0),
         }
 
     # Schedule-only trips (no live vehicle/prediction) stay on the board -
