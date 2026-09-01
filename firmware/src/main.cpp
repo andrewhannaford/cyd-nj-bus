@@ -35,6 +35,7 @@ struct BusEntry {
   int etaMin;
   int secLate;
   int occupancy;  // 0 = unknown, 1..3 = light/medium/full (see bridge app.py)
+  bool realtime;  // false = schedule-only, no live vehicle/prediction - shown as "Scheduled"
 };
 
 struct BoardState {
@@ -54,7 +55,8 @@ uint32_t wifiDownSince = 0; // 0 = currently connected (or not yet tracked)
 
 bool busEqual(const BusEntry &a, const BusEntry &b) {
   return a.route == b.route && a.header == b.header && a.etaMin == b.etaMin &&
-         a.secLate == b.secLate && a.occupancy == b.occupancy && a.etaTime == b.etaTime;
+         a.secLate == b.secLate && a.occupancy == b.occupancy && a.etaTime == b.etaTime &&
+         a.realtime == b.realtime;
 }
 
 // ---------- palette: same app layout, dark mode ----------
@@ -266,10 +268,22 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
     subLine = subLine.substring(0, subLine.length() - 1);
   }
   g.drawString(subLine, DEST_X, subY);
-  if (bus.occupancy > 0) {
-    // Fixed offset (widest plausible "12:46 PM"-style time), not the actual
-    // subLine width, so the icon sits in the same spot on every row.
-    drawOccupancy(g, DEST_X + g.textWidth("12:46 PM") + 14, subY, bus.occupancy);
+  // Fixed offset (widest plausible "12:46 PM"-style time), not the actual
+  // subLine width, so this slot sits in the same spot on every row.
+  int badgeX = DEST_X + g.textWidth("12:46 PM") + 14;
+  if (!bus.realtime) {
+    // No vehicle/live prediction for this trip - occupancy would be made
+    // up, same as the countdown would be, so label it instead of guessing.
+    // Fall back to the shorter form if the full word won't fit before the
+    // reserved ETA column.
+    int badgeMaxW = (ETA_RIGHT - ETA_COL_W) - badgeX - 6;
+    String badge = "Scheduled";
+    if (g.textWidth(badge) > badgeMaxW) badge = "Sched";
+    g.setTextColor(COL_MUTED, bg);
+    g.drawString(badge, badgeX, subY);
+    g.setTextColor(ink, bg);
+  } else if (bus.occupancy > 0) {
+    drawOccupancy(g, badgeX, subY, bus.occupancy);
   }
 
   // ETA, right-aligned and vertically centered on the whole row.
@@ -421,6 +435,7 @@ bool fetchStats() {
     entry.secLate = b["sec_late"] | 0;
     entry.etaTime = String((const char *)(b["eta_time"] | ""));
     entry.occupancy = b["occupancy"] | 0;
+    entry.realtime = b["realtime"] | false;
     board.busCount++;
   }
   return true;

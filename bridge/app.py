@@ -347,16 +347,14 @@ def _fetch_stop(stop_id, now, rt_updates):
             "occupancy": 1,
         }
 
-    # Schedule-only trips (no live vehicle/prediction) are frequently wrong -
-    # NJT's own schedule adherence is loose enough that "45 min" often never
-    # shows. Only trips actively tracked (BUSDV2 vehicle_id or a GTFS-RT
-    # prediction) are trustworthy enough to put on the board. Also drop
-    # trips more than a minute in the past - a "delayed" bus can run a
-    # little behind its predicted time, but a large negative eta_min is a
-    # stale prediction for a trip that's already come and gone, not a real
-    # upcoming arrival (seen repeatedly in GTFS-RT for trips that haven't
-    # aged out of the feed yet).
-    buses = [b for b in buses_by_trip.values() if b["realtime"] and b["eta_min"] >= -1]
+    # Schedule-only trips (no live vehicle/prediction) stay on the board -
+    # the firmware labels them "Scheduled" rather than hiding them, since
+    # NJT's own app shows them too. Still drop trips more than a minute in
+    # the past - a "delayed" bus can run a little behind its predicted
+    # time, but a large negative eta_min is a stale prediction for a trip
+    # that's already come and gone, not a real upcoming arrival (seen
+    # repeatedly in GTFS-RT for trips that haven't aged out of the feed yet).
+    buses = [b for b in buses_by_trip.values() if b["eta_min"] >= -1]
     return stop_name, buses
 
 
