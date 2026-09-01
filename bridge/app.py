@@ -1,23 +1,34 @@
 """
-NJ Transit bus arrivals bridge: calls NJT's official BUSDATA (BUSDV2) API
-for one or more stop IDs and serves a small JSON snapshot for the CYD
-firmware to poll.
+NJ Transit bus arrivals bridge: merges NJT's official BUSDATA (BUSDV2) API
+with the GTFS-RT (GTFSG2) real-time feed for one or more stop IDs, and
+serves a small JSON snapshot for the CYD firmware to poll.
+
+BUSDV2's getBusDV gives route/destination/occupancy but sometimes omits
+imminent trips outright; GTFS-RT's TripUpdates feed has fresher/more
+complete arrival predictions (and real seconds-late) but no route/
+destination text of its own, so a background-refreshed lookup from GTFS-RT's
+static trips.txt fills that in for trips BUSDV2 doesn't know about at all.
 
 Config comes from environment variables (see njt-bridge.env.example and
-.env.njt): STOP_IDS, POLL_INTERVAL, PORT, NJT_USERNAME, NJT_PASSWORD.
+.env.njt): STOP_IDS, POLL_INTERVAL, PORT, NJT_USERNAME, NJT_PASSWORD (the
+same credentials are used for both APIs).
 
 Data provided by NJ TRANSIT, sole owner of the data. This app is not
 endorsed by, affiliated with, or sponsored by NJ TRANSIT.
 """
+import csv
+import io
 import os
 import re
 import threading
 import time
+import zipfile
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify
+from google.transit import gtfs_realtime_pb2
 
 # A physical stop pole gets its own stop_id per direction - list more than
 # one to merge both directions (or multiple nearby poles) into one board.
@@ -27,15 +38,19 @@ PORT = int(os.environ.get("PORT", "8000"))
 NJT_USERNAME = os.environ["NJT_USERNAME"]
 NJT_PASSWORD = os.environ["NJT_PASSWORD"]
 NJT_TIMEOUT_S = 10
+GTFSRT_TIMEOUT_S = 30
+GTFS_STATIC_TIMEOUT_S = 180  # getGTFS is an ~80MB zip, not a quick call
 
-API_BASE = "https://pcsdata.njtransit.com/api/BUSDV2"
+BUSDV2_BASE = "https://pcsdata.njtransit.com/api/BUSDV2"
+GTFSG2_BASE = "https://pcsdata.njtransit.com/api/GTFSG2"
 # NJT says tokens are typically valid ~24h but reserves the right to change
 # that - refresh well before the documented window, and reactively on any
 # "invalid token" response regardless of this timer.
 TOKEN_MAX_AGE_S = 20 * 3600
+TRIP_LOOKUP_REFRESH_S = 24 * 3600
 TZ = ZoneInfo("America/New_York")
 
-DELAYED_SEC_LATE = 300  # API gives no seconds-late figure, just a remarks string - pin past the firmware's critical threshold
+DELAYED_SEC_LATE = 300  # BUSDV2 gives no seconds-late figure, just a remarks string - pin past the firmware's critical threshold
 ETA_MIN_RE = re.compile(r"(\d+)\s*min", re.I)
 SCHED_TIME_FMT = "%m/%d/%Y %I:%M:%S %p"
 # NJT uses the literal strings "EMPTY" and "no data" as null placeholders
@@ -70,76 +85,147 @@ app = Flask(__name__)
 _state_lock = threading.Lock()
 _state = {"ok": False, "error": "not polled yet"}
 _session = requests.Session()
-
-_token_lock = threading.Lock()
-_token = None
-_token_fetched_at = 0.0
 _stop_names = {}  # stop_id -> friendly name, fetched once and cached
+# trip_id -> {"route": ..., "header": ...}, from GTFS-RT's static trips.txt.
+# Reassigned wholesale (never mutated in place) so reads need no lock.
+_trip_lookup = {}
 
 
-class TokenInvalid(Exception):
-    pass
+def _make_api_client(api_base):
+    # BUSDV2 and GTFSG2 are separate token namespaces on the same account -
+    # each needs its own cached token and its own retry-on-invalid-token loop.
+    token_lock = threading.Lock()
+    token_state = {"token": None, "fetched_at": 0.0}
 
-
-def _authenticate():
-    global _token, _token_fetched_at
-    resp = _session.post(
-        f"{API_BASE}/authenticateUser",
-        data={"username": NJT_USERNAME, "password": NJT_PASSWORD},
-        timeout=NJT_TIMEOUT_S,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("Authenticated") != "True" or not data.get("UserToken"):
-        raise RuntimeError("NJT auth failed - check NJT_USERNAME/NJT_PASSWORD")
-    with _token_lock:
-        _token = data["UserToken"]
-        _token_fetched_at = time.time()
-    return _token
-
-
-def _get_token(force=False):
-    with _token_lock:
-        stale = _token is None or (time.time() - _token_fetched_at) > TOKEN_MAX_AGE_S
-    if force or stale:
-        return _authenticate()
-    return _token
-
-
-def _api_call(endpoint, **fields):
-    # A token can go bad before our own freshness timer says so (NJT-side
-    # revocation, clock drift) - retry once with a forced re-auth before
-    # giving up, same shape as the old scraper's Cloudflare-retry pattern.
-    for attempt in range(2):
-        token = _get_token(force=(attempt == 1))
+    def authenticate():
         resp = _session.post(
-            f"{API_BASE}/{endpoint}",
-            data={"token": token, **fields},
+            f"{api_base}/authenticateUser",
+            data={"username": NJT_USERNAME, "password": NJT_PASSWORD},
             timeout=NJT_TIMEOUT_S,
         )
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, dict) and "token" in data.get("errorMessage", "").lower():
-            continue
-        if isinstance(data, dict) and "errorMessage" in data:
-            raise RuntimeError(f"{endpoint}: {data['errorMessage']}")
-        return data
-    raise RuntimeError(f"{endpoint}: token kept getting rejected")
+        if data.get("Authenticated") != "True" or not data.get("UserToken"):
+            raise RuntimeError(f"NJT auth failed for {api_base} - check NJT_USERNAME/NJT_PASSWORD")
+        with token_lock:
+            token_state["token"] = data["UserToken"]
+            token_state["fetched_at"] = time.time()
+        return token_state["token"]
+
+    def get_token(force=False):
+        with token_lock:
+            stale = token_state["token"] is None or (time.time() - token_state["fetched_at"]) > TOKEN_MAX_AGE_S
+        if force or stale:
+            return authenticate()
+        return token_state["token"]
+
+    def call(endpoint, timeout=NJT_TIMEOUT_S, binary=False, **fields):
+        # A token can go bad before our own freshness timer says so (NJT-side
+        # revocation, clock drift) - retry once with a forced re-auth before
+        # giving up.
+        for attempt in range(2):
+            token = get_token(force=(attempt == 1))
+            resp = _session.post(f"{api_base}/{endpoint}", data={"token": token, **fields}, timeout=timeout)
+            resp.raise_for_status()
+            if binary:
+                # Binary endpoints (protobuf/zip) still return a small JSON
+                # body on error instead of the expected content type.
+                if resp.headers.get("content-type", "").startswith("application/json"):
+                    err = resp.json().get("errorMessage", "")
+                    if "token" in err.lower():
+                        continue
+                    raise RuntimeError(f"{endpoint}: {err or resp.text[:200]}")
+                return resp.content
+            data = resp.json()
+            if isinstance(data, dict) and "token" in data.get("errorMessage", "").lower():
+                continue
+            if isinstance(data, dict) and "errorMessage" in data:
+                raise RuntimeError(f"{endpoint}: {data['errorMessage']}")
+            return data
+        raise RuntimeError(f"{endpoint}: token kept getting rejected")
+
+    return call
+
+
+_busdv2 = _make_api_client(BUSDV2_BASE)
+_gtfsg2 = _make_api_client(GTFSG2_BASE)
 
 
 def _get_stop_name(stop_id):
     if stop_id not in _stop_names:
-        data = _api_call("getStopName", stopnum=stop_id)
+        data = _busdv2("getStopName", stopnum=stop_id)
         _stop_names[stop_id] = data.get("stopName", "")
     return _stop_names[stop_id]
 
 
-def _fetch_stop(stop_id, now):
+def _refresh_trip_lookup():
+    global _trip_lookup
+    content = _gtfsg2("getGTFS", timeout=GTFS_STATIC_TIMEOUT_S, binary=True)
+    lookup = {}
+    with zipfile.ZipFile(io.BytesIO(content)) as zf, zf.open("trips.txt") as f:
+        reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
+        for row in reader:
+            lookup[row["trip_id"]] = {
+                "route": row["route_id"].strip(),
+                "header": re.sub(r"\s+", " ", row["trip_headsign"]).strip(),
+            }
+    _trip_lookup = lookup  # atomic reference swap - no lock needed for readers
+
+
+def _trip_lookup_loop():
+    while True:
+        try:
+            _refresh_trip_lookup()
+        except Exception as exc:  # keep serving with the last-good (or empty) cache
+            print(f"[trip_lookup] refresh failed, keeping previous cache: {exc}", flush=True)
+        time.sleep(TRIP_LOOKUP_REFRESH_S)
+
+
+def _fetch_realtime_updates():
+    """Live arrival predictions for our configured stops, keyed by trip_id.
+
+    GTFS-RT is the authoritative real-time source: it includes imminent
+    trips BUSDV2's own getBusDV sometimes omits entirely, and carries a real
+    seconds-late figure instead of BUSDV2's boolean-ish delay signal.
+    """
+    content = _gtfsg2("getTripUpdates", timeout=GTFSRT_TIMEOUT_S, binary=True)
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(content)
+
+    now = datetime.now(TZ)
+    stop_id_set = set(STOP_IDS)
+    by_stop = {stop_id: {} for stop_id in STOP_IDS}
+    for entity in feed.entity:
+        if not entity.HasField("trip_update"):
+            continue
+        trip_id = entity.trip_update.trip.trip_id
+        for stu in entity.trip_update.stop_time_update:
+            if stu.stop_id not in stop_id_set:
+                continue
+            event = stu.arrival if stu.HasField("arrival") else (stu.departure if stu.HasField("departure") else None)
+            if event is None or not event.time:
+                continue  # no real-time prediction for this stop on this trip
+            eta_dt = datetime.fromtimestamp(event.time, TZ)
+            eta_min = round((eta_dt - now).total_seconds() / 60)
+            sec_late = max(event.delay, 0) if event.HasField("delay") else 0
+            # Clock skew/rounding can put an on-time prediction a few seconds
+            # negative; a real delay is already reflected in eta_dt itself.
+            if eta_min < 0 and sec_late == 0:
+                eta_min = 0
+            by_stop[stu.stop_id][trip_id] = {
+                "eta_min": eta_min,
+                "eta_time": eta_dt.strftime("%I:%M %p").lstrip("0"),
+                "sec_late": sec_late,
+            }
+    return by_stop
+
+
+def _fetch_stop(stop_id, now, rt_updates):
     stop_name = _get_stop_name(stop_id)
-    data = _api_call("getBusDV", stop=stop_id, direction="", route="", IP="")
+    data = _busdv2("getBusDV", stop=stop_id, direction="", route="", IP="")
     trips = data.get("DVTrip") or []
 
-    buses = []
+    buses_by_trip = {}
     for trip in trips:
         route = (trip.get("public_route") or "").strip()
         dest = re.sub(r"\s+", " ", (trip.get("header") or "")).strip()
@@ -183,22 +269,59 @@ def _fetch_stop(stop_id, now):
         eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
 
         vehicle_id = _sentinel(trip.get("vehicle_id"))
-        buses.append(
-            {
-                "route": route,
-                "header": dest,
-                "eta_min": eta_min,
-                "eta_time": eta_time,
-                "sec_late": DELAYED_SEC_LATE if delayed else 0,
-                "realtime": vehicle_id is not None,
-                "vehicle_id": vehicle_id,
-                "occupancy": _occupancy_level(trip.get("passload")),
-            }
-        )
-    return stop_name, buses
+        bus = {
+            "route": route,
+            "header": dest,
+            "eta_min": eta_min,
+            "eta_time": eta_time,
+            "sec_late": DELAYED_SEC_LATE if delayed else 0,
+            "realtime": vehicle_id is not None,
+            "vehicle_id": vehicle_id,
+            "occupancy": _occupancy_level(trip.get("passload")),
+        }
+        trip_id = _sentinel(trip.get("internal_trip_number"))
+        buses_by_trip[trip_id or id(trip)] = bus
+
+    # GTFS-RT overrides eta/delay for trips BUSDV2 already knows about (it's
+    # the fresher, more complete source), and adds trips BUSDV2 omitted
+    # entirely - route/destination for those comes from the static trip
+    # lookup instead, since GTFS-RT's own trip_update carries neither.
+    for trip_id, rt in rt_updates.items():
+        if trip_id in buses_by_trip:
+            bus = buses_by_trip[trip_id]
+            bus["eta_min"] = rt["eta_min"]
+            bus["eta_time"] = rt["eta_time"]
+            bus["sec_late"] = rt["sec_late"]
+            bus["realtime"] = True
+            continue
+        lookup = _trip_lookup.get(trip_id)
+        if not lookup:
+            continue  # no cached static metadata for this trip yet - skip rather than show a blank route
+        route = lookup["route"]
+        header = re.sub(r"^" + re.escape(route) + r"[A-Z]?\s+", "", lookup["header"])
+        buses_by_trip[trip_id] = {
+            "route": route,
+            "header": header,
+            "eta_min": rt["eta_min"],
+            "eta_time": rt["eta_time"],
+            "sec_late": rt["sec_late"],
+            "realtime": True,
+            "vehicle_id": None,
+            "occupancy": 1,
+        }
+
+    return stop_name, list(buses_by_trip.values())
 
 
 def _poll_once():
+    now = datetime.now(TZ)
+    try:
+        rt_by_stop = _fetch_realtime_updates()
+    except Exception as exc:
+        # Not fatal - BUSDV2 alone still gives a usable, if less complete, board.
+        print(f"[gtfs-rt] fetch failed, falling back to BUSDV2-only: {exc}", flush=True)
+        rt_by_stop = {}
+
     all_buses = []
     stop_name = None
     errors = []
@@ -206,7 +329,7 @@ def _poll_once():
     # the whole board (including the OTHER direction's good data) with it.
     for stop_id in STOP_IDS:
         try:
-            name, buses = _fetch_stop(stop_id, datetime.now(TZ))
+            name, buses = _fetch_stop(stop_id, now, rt_by_stop.get(stop_id, {}))
         except Exception as exc:
             errors.append(f"{stop_id}: {exc}")
             continue
@@ -251,6 +374,7 @@ def stats():
 # Started at import time, not just under __main__ - gunicorn imports this
 # module rather than executing it directly, so a __main__-only start never runs.
 threading.Thread(target=_poll_loop, daemon=True).start()
+threading.Thread(target=_trip_lookup_loop, daemon=True).start()
 
 if __name__ == "__main__":
     # threaded=True: unauthenticated and reachable from the public internet,

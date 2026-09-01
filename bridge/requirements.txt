@@ -1,3 +1,5 @@
 flask==3.0.3
 requests==2.32.3
 tzdata==2024.1
+gtfs-realtime-bindings==2.2.0
+gunicorn==23.0.0
