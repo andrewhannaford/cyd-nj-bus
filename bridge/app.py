@@ -310,7 +310,12 @@ def _fetch_stop(stop_id, now, rt_updates):
             "occupancy": 1,
         }
 
-    return stop_name, list(buses_by_trip.values())
+    # Schedule-only trips (no live vehicle/prediction) are frequently wrong -
+    # NJT's own schedule adherence is loose enough that "45 min" often never
+    # shows. Only trips actively tracked (BUSDV2 vehicle_id or a GTFS-RT
+    # prediction) are trustworthy enough to put on the board.
+    buses = [b for b in buses_by_trip.values() if b["realtime"]]
+    return stop_name, buses
 
 
 def _poll_once():
