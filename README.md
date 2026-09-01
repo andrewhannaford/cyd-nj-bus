@@ -27,15 +27,19 @@ revert to.
 ## Status: LIVE
 
 - **Bridge**: deployed as `njt-bus-bridge` on `docker-svc` (10.20.0.193),
-  `/opt/docker/services/njt-bus-bridge/`. Reachable only publicly now, at
-  `https://njtbus.lanarchy.net/stats` — routed through the home Traefik
-  proxy, same unauthenticated `crowdsec-bouncer + rate-limit +
-  secure-headers` chain as the portfolio sites (no Pocket ID — an ESP32
-  can't do OIDC login, and bus arrival times aren't sensitive). All units
-  use this path now, even ones on the home LAN - simpler than maintaining
-  a separate direct-LAN route (`docker-svc.home:8001` is still the
-  bridge's own listen address, just no longer routed to directly by any
-  device).
+  `/opt/docker/services/njt-bus-bridge/`. Every unit's firmware now
+  builds with the same `https://njtbus.lanarchy.net/stats` BRIDGE_URL
+  (see below), but that hostname still needs **two** Traefik routers on
+  the proxy side (`lanarchy-traefik/dynamic_conf/app_njtbus.yaml`): home-
+  network clients resolve it to the internal IP via local DNS regardless
+  of which URL the firmware uses, landing on the internal (`websecure`)
+  entrypoint, while genuinely off-network gift units reach it via the
+  `public` entrypoint over the internet. Removing the internal router
+  (assuming the single BRIDGE_URL made it redundant) took both
+  home-network units offline until it was restored — don't repeat that.
+  Same unauthenticated `crowdsec-bouncer + rate-limit + secure-headers`
+  chain as the portfolio sites on the public side (no Pocket ID — an
+  ESP32 can't do OIDC login, and bus arrival times aren't sensitive).
 - **Firmware**: flashed and running on two physical units, both stop
   21923 (Port Imperial Blvd at Riverwalk Place, routes 158/159 to NYC).
 - Redeploy the bridge after any `bridge/app.py` change:
