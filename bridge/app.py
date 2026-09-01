@@ -261,8 +261,17 @@ def _fetch_stop(stop_id, now, rt_updates):
                 sched_dt = None
                 eta_min = None
 
+        # A live-formatted "in N mins"/"due" countdown isn't on its own proof
+        # of real tracking - BUSDV2 can show one from schedule-pattern
+        # estimation with no vehicle actually assigned (confirmed: a trip
+        # with vehicle_id "EMPTY" AND a GTFS-RT NO_DATA relationship for this
+        # exact stop still got a live-formatted countdown here). A real
+        # vehicle_id is the trustworthy signal on the BUSDV2 side; GTFS-RT
+        # confirmation (below, in the merge step) is the other, independent
+        # path for promoting a trip BUSDV2 itself has no vehicle for yet.
+        vehicle_id = _sentinel(trip.get("vehicle_id"))
+        live_tracked = vehicle_id is not None
         m = ETA_MIN_RE.search(status)
-        live_tracked = bool(m) or "due" in status.lower() or delayed
         if m:
             eta_min = int(m.group(1))
         elif "due" in status.lower() and eta_min is None:
@@ -288,16 +297,12 @@ def _fetch_stop(stop_id, now, rt_updates):
         else:
             eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
 
-        vehicle_id = _sentinel(trip.get("vehicle_id"))
         bus = {
             "route": route,
             "header": dest,
             "eta_min": eta_min,
             "eta_time": eta_time,
             "sec_late": DELAYED_SEC_LATE if delayed else 0,
-            # A live countdown (departurestatus) means NJT is actively
-            # tracking this trip, whether or not it also gave us a vehicle
-            # number - the two are independent fields, not the same signal.
             "realtime": live_tracked,
             "vehicle_id": vehicle_id,
             "occupancy": _occupancy_level(trip.get("passload")),
