@@ -206,7 +206,9 @@ def _fetch_realtime_updates():
             if event is None or not event.time:
                 continue  # no real-time prediction for this stop on this trip
             eta_dt = datetime.fromtimestamp(event.time, TZ)
-            eta_min = round((eta_dt - now).total_seconds() / 60)
+            # Floor, not round - transit apps (including NJT's own) never
+            # show a bigger number than the true remaining time.
+            eta_min = int((eta_dt - now).total_seconds() // 60)
             sec_late = max(event.delay, 0) if event.HasField("delay") else 0
             # Clock skew/rounding can put an on-time prediction a few seconds
             # negative; a real delay is already reflected in eta_dt itself.
@@ -252,7 +254,9 @@ def _fetch_stop(stop_id, now, rt_updates):
         if sched_raw:
             try:
                 sched_dt = datetime.strptime(sched_raw, SCHED_TIME_FMT).replace(tzinfo=TZ)
-                eta_min = round((sched_dt - now).total_seconds() / 60)
+                # Floor, not round - see the matching comment in
+                # _fetch_realtime_updates.
+                eta_min = int((sched_dt - now).total_seconds() // 60)
             except ValueError:
                 sched_dt = None
                 eta_min = None
