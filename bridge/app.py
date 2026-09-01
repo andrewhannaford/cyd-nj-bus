@@ -227,7 +227,11 @@ def _fetch_realtime_updates():
             sec_late = max(event.delay, 0) if event.HasField("delay") else 0
             # Clock skew/rounding can put an on-time prediction a few seconds
             # negative; a real delay is already reflected in eta_dt itself.
-            if eta_min < 0 and sec_late == 0:
+            # Only clamp truly marginal cases - a prediction that's minutes
+            # stale (a negative GTFS-RT `delay` just means "early", not
+            # "fresh") should stay negative so the caller's staleness filter
+            # can drop it, not get pinned at 0 forever.
+            if -2 <= eta_min < 0 and sec_late == 0:
                 eta_min = 0
             by_stop[stu.stop_id][trip_id] = {
                 "eta_min": eta_min,
