@@ -84,7 +84,7 @@ static const int ROW_H = (SCREEN_H - HEADER_H) / MAX_BUSES; // 65px - 3 text lin
 static const int ROUTE_X = 10;
 static const int ROUTE_COL_W = 52; // route numbers right-align within this so they line up
 static const int DEST_X = ROUTE_X + ROUTE_COL_W + 10;
-static const int ETA_COL_W = 76; // reserved width for "Delayed"/"99 min" on the right
+static const int ETA_COL_W = 56; // reserved width for "99 min"/"Due" on the right - no longer needs to fit "Delayed"
 static const int ETA_RIGHT = SCREEN_W - 10;
 static const int DEST_MAX_W = (ETA_RIGHT - ETA_COL_W) - DEST_X - 6;
 
@@ -270,13 +270,13 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   g.drawString(subLine, DEST_X, subY);
   // Fixed offset (widest plausible "12:46 PM"-style time), not the actual
   // subLine width, so this slot sits in the same spot on every row.
-  int badgeX = DEST_X + g.textWidth("12:46 PM") + 14;
+  int badgeX = DEST_X + g.textWidth("12:46 PM") + 6;
   if (!bus.realtime) {
     // No vehicle/live prediction for this trip - occupancy would be made
     // up, same as the countdown would be, so label it instead of guessing.
     // Fall back to the shorter form if the full word won't fit before the
     // reserved ETA column.
-    int badgeMaxW = (ETA_RIGHT - ETA_COL_W) - badgeX - 6;
+    int badgeMaxW = (ETA_RIGHT - ETA_COL_W) - badgeX - 2;
     String badge = "Scheduled";
     if (g.textWidth(badge) > badgeMaxW) badge = "Sched";
     g.setTextColor(COL_MUTED, bg);
