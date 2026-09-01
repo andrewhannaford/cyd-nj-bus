@@ -84,7 +84,7 @@ static const int ROW_H = (SCREEN_H - HEADER_H) / MAX_BUSES; // 65px - 3 text lin
 static const int ROUTE_X = 10;
 static const int ROUTE_COL_W = 52; // route numbers right-align within this so they line up
 static const int DEST_X = ROUTE_X + ROUTE_COL_W + 10;
-static const int ETA_COL_W = 56; // reserved width for "99 min"/"Due" on the right - no longer needs to fit "Delayed"
+static const int ETA_COL_W = 56; // reserved width for "99 min"/"<1 min" on the right - no longer needs to fit "Delayed"
 static const int ETA_RIGHT = SCREEN_W - 10;
 static const int DEST_MAX_W = (ETA_RIGHT - ETA_COL_W) - DEST_X - 6;
 
@@ -292,7 +292,7 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   // ETA, right-aligned and vertically centered on the whole row.
   char etaBuf[10];
   if (bus.etaMin <= 0) {
-    snprintf(etaBuf, sizeof(etaBuf), "Due");
+    snprintf(etaBuf, sizeof(etaBuf), "<1 min");
   } else {
     snprintf(etaBuf, sizeof(etaBuf), "%d min", bus.etaMin);
   }
