@@ -27,15 +27,17 @@ revert to.
 ## Status: LIVE
 
 - **Bridge**: deployed as `njt-bus-bridge` on `docker-svc` (10.20.0.193),
-  `/opt/docker/services/njt-bus-bridge/`. Reachable two ways:
-  - LAN: `http://docker-svc.home:8001/stats`
-  - Public (for gift units off-network): `https://njtbus.lanarchy.net/stats`
-    — routed through the home Traefik proxy, same unauthenticated
-    `crowdsec-bouncer + rate-limit + secure-headers` chain as the
-    portfolio sites (no Pocket ID — an ESP32 can't do OIDC login, and
-    bus arrival times aren't sensitive).
-- **Firmware**: flashed and running on one physical unit, stop 21923
-  (Port Imperial Blvd at Riverwalk Place, routes 158/159 to NYC).
+  `/opt/docker/services/njt-bus-bridge/`. Reachable only publicly now, at
+  `https://njtbus.lanarchy.net/stats` — routed through the home Traefik
+  proxy, same unauthenticated `crowdsec-bouncer + rate-limit +
+  secure-headers` chain as the portfolio sites (no Pocket ID — an ESP32
+  can't do OIDC login, and bus arrival times aren't sensitive). All units
+  use this path now, even ones on the home LAN - simpler than maintaining
+  a separate direct-LAN route (`docker-svc.home:8001` is still the
+  bridge's own listen address, just no longer routed to directly by any
+  device).
+- **Firmware**: flashed and running on two physical units, both stop
+  21923 (Port Imperial Blvd at Riverwalk Place, routes 158/159 to NYC).
 - Redeploy the bridge after any `bridge/app.py` change:
   ```
   scp bridge/app.py docker-svc@10.20.0.193:/opt/docker/services/njt-bus-bridge/app.py
@@ -56,15 +58,19 @@ stopped working — router replaced, password changed), it automatically
 reopens the setup portal rather than getting stuck forever needing a
 manual power cycle.
 
-## Two PlatformIO environments — same firmware, different bridge URL
+## Building and flashing
 
 ```
-pio run -e lan -t upload      # points at http://docker-svc.home:8001/stats (your own units)
-pio run -e public -t upload   # points at https://njtbus.lanarchy.net/stats (gift units)
+pio run -t upload   # points at https://njtbus.lanarchy.net/stats - same build for every unit
 ```
 
 No `secrets.h` needed at all — `BRIDGE_URL` is a build-time flag in
 `platformio.ini`, WiFi is handled entirely by the captive portal.
+
+(Previously had separate `lan`/`public` PlatformIO environments so
+same-LAN units could skip the WAN round trip - dropped in favor of one
+build for every unit, since the bandwidth/latency difference didn't
+matter in practice and it halved the number of things to keep in sync.)
 
 ## UI
 
