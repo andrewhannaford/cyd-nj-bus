@@ -279,7 +279,9 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   if (g.textWidth(etaBuf) > ETA_COL_W) {
     g.setFreeFont(&FreeSansBold9pt7b);
   }
-  g.setTextColor(statusColor(bus.secLate, ink), bg);
+  // Red-on-navy was hard to read for "Delayed" specifically - keep the
+  // ink color there instead of the lateness color-coding.
+  g.setTextColor(bus.etaMin < 0 ? ink : statusColor(bus.secLate, ink), bg);
   g.setTextDatum(MR_DATUM);
   g.drawString(etaBuf, ETA_RIGHT, cy);
 }
