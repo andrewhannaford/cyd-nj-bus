@@ -1,15 +1,10 @@
 """
-NJ Transit bus arrivals bridge: scrapes NJT's public MyBus site
-(mybusnow.njtransit.com) for one or more stop IDs and serves a small JSON
-snapshot for the CYD firmware to poll.
+NJ Transit bus arrivals bridge: calls NJT's official BUSDATA (BUSDV2) API
+for one or more stop IDs and serves a small JSON snapshot for the CYD
+firmware to poll.
 
-Uses the same unauthenticated "wireless" (text-only) rider-facing pages
-the mobile site itself uses - no developer API key required. NJT could
-change this markup at any time; switch back to getNextTripsXML (see git
-history) once a developer account is approved.
-
-Config comes from environment variables (see njt-bridge.env.example):
-  STOP_IDS, POLL_INTERVAL, PORT
+Config comes from environment variables (see njt-bridge.env.example and
+.env.njt): STOP_IDS, POLL_INTERVAL, PORT, NJT_USERNAME, NJT_PASSWORD.
 
 Data provided by NJ TRANSIT, sole owner of the data. This app is not
 endorsed by, affiliated with, or sponsored by NJ TRANSIT.
@@ -29,40 +24,39 @@ from flask import Flask, jsonify
 STOP_IDS = [s.strip() for s in os.environ["STOP_IDS"].split(",") if s.strip()]
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 PORT = int(os.environ.get("PORT", "8000"))
+NJT_USERNAME = os.environ["NJT_USERNAME"]
+NJT_PASSWORD = os.environ["NJT_PASSWORD"]
 NJT_TIMEOUT_S = 10
 
-MYBUS_HOME_URL = "https://mybusnow.njtransit.com/bustime/wireless/html/home.jsp"
-MYBUS_ETA_URL = "https://mybusnow.njtransit.com/bustime/wireless/html/eta.jsp"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+API_BASE = "https://pcsdata.njtransit.com/api/BUSDV2"
+# NJT says tokens are typically valid ~24h but reserves the right to change
+# that - refresh well before the documented window, and reactively on any
+# "invalid token" response regardless of this timer.
+TOKEN_MAX_AGE_S = 20 * 3600
 TZ = ZoneInfo("America/New_York")
 
-# Each prediction block on eta.jsp looks like:
-#   <strong class="larger">#158&nbsp;</strong> ... To ... 158 NEW YORK VIA RIVER ROAD
-#   ... <strong class="larger">7&nbsp;MIN</strong>  (or "DELAYED", or "&lt; 1 MIN")
-#   <span class="smaller"> ... (Vehicle 20872) ... (Passengers: Light) </span>
-# The (Vehicle #) line only appears when a real bus is actively GPS-tracked
-# for that trip; its absence is NJT's own signal for a schedule-based
-# estimate with no live vehicle assigned yet (there's no separate flag).
-BLOCK_RE = re.compile(
-    r'<strong class="larger">#(?P<route>\S+?)&nbsp;</strong>.*?'
-    r'To\s*(?P<dest>.*?)\s*'
-    r'<strong class="larger">(?P<eta>.*?)</strong>'
-    r'(?P<tail>.*?)(?=<hr|$)',  # fall back to end-of-string if a trailing <hr is ever missing
-    re.S,
-)
-STOP_NAME_RE = re.compile(r"Selected Stop:\s*(.+?)\s*<")
-VEHICLE_RE = re.compile(r"\(Vehicle\s*(\d+)\)")
-PASSENGERS_RE = re.compile(r"\(Passengers:\s*([^)]+)\)")
-DELAYED_SEC_LATE = 300  # scrape only gives a boolean "DELAYED" flag, no seconds - pin it past the firmware's critical threshold
+DELAYED_SEC_LATE = 300  # API gives no seconds-late figure, just a remarks string - pin past the firmware's critical threshold
+ETA_MIN_RE = re.compile(r"(\d+)\s*min", re.I)
+SCHED_TIME_FMT = "%m/%d/%Y %I:%M:%S %p"
+# NJT uses the literal strings "EMPTY" and "no data" as null placeholders
+# across DVTrip fields instead of omitting them - normalize those away.
+_NULL_SENTINELS = {"", "empty", "no data", "n/a"}
 
-# NJT's own app shows a 3-figure occupancy icon (n of 3 filled); the wireless
-# page only gives a text label, and only when a vehicle happens to report
-# one, so this is a best-effort mapping onto the same 3-level scale.
-def _occupancy_level(tail):
-    m = PASSENGERS_RE.search(tail)
-    if not m:
-        return 0
-    label = m.group(1).strip().lower()
+
+def _sentinel(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in _NULL_SENTINELS else text
+
+
+# NJT's own app shows a 3-figure occupancy icon (n of 3 filled); passload is
+# a coarse text label, and only present when a vehicle is actively assigned.
+def _occupancy_level(passload):
+    passload = _sentinel(passload)
+    if not passload:
+        return 1  # no data reported - default to low so the icon always shows
+    label = passload.strip().lower()
     if "full" in label or "crowd" in label or "heavy" in label:
         return 3
     if "medium" in label or "moderate" in label:
@@ -71,73 +65,124 @@ def _occupancy_level(tail):
         return 1
     return 0
 
+
 app = Flask(__name__)
 _state_lock = threading.Lock()
 _state = {"ok": False, "error": "not polled yet"}
 _session = requests.Session()
-_session.headers["User-Agent"] = USER_AGENT
+
+_token_lock = threading.Lock()
+_token = None
+_token_fetched_at = 0.0
+_stop_names = {}  # stop_id -> friendly name, fetched once and cached
+
+
+class TokenInvalid(Exception):
+    pass
+
+
+def _authenticate():
+    global _token, _token_fetched_at
+    resp = _session.post(
+        f"{API_BASE}/authenticateUser",
+        data={"username": NJT_USERNAME, "password": NJT_PASSWORD},
+        timeout=NJT_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("Authenticated") != "True" or not data.get("UserToken"):
+        raise RuntimeError("NJT auth failed - check NJT_USERNAME/NJT_PASSWORD")
+    with _token_lock:
+        _token = data["UserToken"]
+        _token_fetched_at = time.time()
+    return _token
+
+
+def _get_token(force=False):
+    with _token_lock:
+        stale = _token is None or (time.time() - _token_fetched_at) > TOKEN_MAX_AGE_S
+    if force or stale:
+        return _authenticate()
+    return _token
+
+
+def _api_call(endpoint, **fields):
+    # A token can go bad before our own freshness timer says so (NJT-side
+    # revocation, clock drift) - retry once with a forced re-auth before
+    # giving up, same shape as the old scraper's Cloudflare-retry pattern.
+    for attempt in range(2):
+        token = _get_token(force=(attempt == 1))
+        resp = _session.post(
+            f"{API_BASE}/{endpoint}",
+            data={"token": token, **fields},
+            timeout=NJT_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "token" in data.get("errorMessage", "").lower():
+            continue
+        if isinstance(data, dict) and "errorMessage" in data:
+            raise RuntimeError(f"{endpoint}: {data['errorMessage']}")
+        return data
+    raise RuntimeError(f"{endpoint}: token kept getting rejected")
+
+
+def _get_stop_name(stop_id):
+    if stop_id not in _stop_names:
+        data = _api_call("getStopName", stopnum=stop_id)
+        _stop_names[stop_id] = data.get("stopName", "")
+    return _stop_names[stop_id]
 
 
 def _fetch_stop(stop_id, now):
-    # eta.jsp 500s without a valid session cookie (from Cloudflare's bot
-    # check) - re-warm the session and retry once before giving up.
-    for attempt in range(2):
-        resp = _session.get(
-            MYBUS_ETA_URL,
-            params={
-                "route": "---",
-                "direction": "---",
-                "displaydirection": "---",
-                "stop": "---",
-                "findstop": "on",
-                "selectedRtpiFeeds": "",
-                "id": stop_id,
-            },
-            timeout=NJT_TIMEOUT_S,
-        )
-        if resp.ok and "Error processing request" not in resp.text:
-            break
-        _session.get(MYBUS_HOME_URL, timeout=NJT_TIMEOUT_S)
-    resp.raise_for_status()
-    html = resp.text
-
-    m = STOP_NAME_RE.search(html)
-    if not m:
-        # A 200 with no "Selected Stop:" marker means the page didn't render
-        # as expected (a different soft failure than the 500/challenge case
-        # already retried above) - raise instead of silently reporting
-        # ok=True with zero buses, which would look like "no buses" to the
-        # firmware rather than "the scrape broke."
-        raise RuntimeError(f"stop {stop_id}: unexpected page, no stop name found")
-    stop_name = m.group(1).strip()
+    stop_name = _get_stop_name(stop_id)
+    data = _api_call("getBusDV", stop=stop_id, direction="", route="", IP="")
+    trips = data.get("DVTrip") or []
 
     buses = []
-    for m in BLOCK_RE.finditer(html):
-        eta_raw = m.group("eta").replace("&nbsp;", " ").strip()
-        route = m.group("route").strip()
-        dest = re.sub(r"\s+", " ", m.group("dest").replace("&nbsp;", " ")).strip()
-        # "158 NEW YORK VIA RIVER ROAD" -> "NEW YORK VIA RIVER ROAD"; the board
-        # shows the route on its own badge, so the prefix just eats width.
+    for trip in trips:
+        route = (trip.get("public_route") or "").strip()
+        dest = re.sub(r"\s+", " ", (trip.get("header") or "")).strip()
+        # "158 NEW YORK VIA RIVER ROAD" -> "NEW YORK VIA RIVER ROAD"; the
+        # board shows the route on its own badge, so the prefix just eats width.
         dest = re.sub(r"^" + re.escape(route) + r"[A-Z]?\s+", "", dest)
-        tail = m.group("tail")
-        delayed = eta_raw.upper() == "DELAYED"
-        digits = re.search(r"\d+", eta_raw)
-        if digits:
-            eta_min = int(digits.group())
-        elif delayed:
-            eta_min = -1  # sentinel the firmware renders as "Delayed"
-        else:
-            eta_min = 0  # e.g. a digit-less "DUE" - imminent, not delayed
 
-        vehicle_m = VEHICLE_RE.search(tail)
-        # Absolute clock time, like the app's "6:01 PM" - not on this page at
-        # all, so it's derived the same way a countdown implies a clock time.
-        eta_time = None
-        if eta_min >= 0:
-            # %-I (no leading zero) is a glibc extension, not portable -
-            # format normally and strip a leading zero instead.
-            eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
+        remarks = _sentinel(trip.get("remarks")) or ""
+        # "departurestatus" (e.g. "in 13 mins") only appears once a vehicle
+        # is actively tracked; otherwise it just repeats "departuretime",
+        # the scheduled clock time, which sched_dep_time below is parsed from.
+        status = _sentinel(trip.get("departurestatus")) or ""
+        delayed = "delay" in remarks.lower() or "delay" in status.lower()
 
+        eta_min = None
+        sched_raw = _sentinel(trip.get("sched_dep_time"))
+        if sched_raw:
+            try:
+                sched_dt = datetime.strptime(sched_raw, SCHED_TIME_FMT).replace(tzinfo=TZ)
+                eta_min = round((sched_dt - now).total_seconds() / 60)
+            except ValueError:
+                eta_min = None
+
+        m = ETA_MIN_RE.search(status)
+        if m:
+            eta_min = int(m.group(1))
+        elif "due" in status.lower() and eta_min is None:
+            eta_min = 0
+
+        if eta_min is None:
+            # No live countdown and an unparseable schedule time - skip this
+            # one trip rather than fail the whole stop over a single bad entry.
+            continue
+        # Clock skew/rounding can put an on-time trip a few seconds negative
+        # right at departure; only a real delay should ever go negative.
+        if eta_min < 0 and not delayed:
+            eta_min = 0
+
+        # %-I (no leading zero) is a glibc extension, not portable - format
+        # normally and strip a leading zero instead.
+        eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
+
+        vehicle_id = _sentinel(trip.get("vehicle_id"))
         buses.append(
             {
                 "route": route,
@@ -145,9 +190,9 @@ def _fetch_stop(stop_id, now):
                 "eta_min": eta_min,
                 "eta_time": eta_time,
                 "sec_late": DELAYED_SEC_LATE if delayed else 0,
-                "realtime": vehicle_m is not None,
-                "vehicle_id": vehicle_m.group(1) if vehicle_m else None,
-                "occupancy": _occupancy_level(tail),
+                "realtime": vehicle_id is not None,
+                "vehicle_id": vehicle_id,
+                "occupancy": _occupancy_level(trip.get("passload")),
             }
         )
     return stop_name, buses
@@ -203,8 +248,11 @@ def stats():
         return jsonify(dict(_state))
 
 
+# Started at import time, not just under __main__ - gunicorn imports this
+# module rather than executing it directly, so a __main__-only start never runs.
+threading.Thread(target=_poll_loop, daemon=True).start()
+
 if __name__ == "__main__":
-    threading.Thread(target=_poll_loop, daemon=True).start()
     # threaded=True: unauthenticated and reachable from the public internet,
     # with multiple gift units polling it - don't serialize their requests.
     app.run(host="0.0.0.0", port=PORT, threaded=True)

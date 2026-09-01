@@ -260,7 +260,9 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   }
   g.drawString(subLine, DEST_X, subY);
   if (bus.occupancy > 0) {
-    drawOccupancy(g, DEST_X + g.textWidth(subLine) + 14, subY, bus.occupancy);
+    // Fixed offset (widest plausible "12:46 PM"-style time), not the actual
+    // subLine width, so the icon sits in the same spot on every row.
+    drawOccupancy(g, DEST_X + g.textWidth("12:46 PM") + 14, subY, bus.occupancy);
   }
 
   // ETA, right-aligned and vertically centered on the whole row.
