@@ -309,9 +309,12 @@ def _fetch_stop(stop_id, now, rt_updates):
         if trip_id in buses_by_trip:
             bus = buses_by_trip[trip_id]
             bus["eta_min"] = rt["eta_min"]
-            bus["eta_time"] = rt["eta_time"]
             bus["sec_late"] = rt["sec_late"]
             bus["realtime"] = True
+            # eta_time deliberately left alone - it's already NJT's own
+            # sched_dep_time (matches what the app shows there), and GTFS-RT's
+            # own predicted time is a different, delay-adjusted value that
+            # would silently drift it away from the app's displayed time.
             continue
         lookup = _trip_lookup.get(trip_id)
         if not lookup:
@@ -374,7 +377,10 @@ def _poll_once():
     if not all_buses and errors:
         raise RuntimeError("; ".join(errors))
 
-    all_buses.sort(key=lambda b: b["eta_min"] if b["eta_min"] >= 0 else 10**9)
+    # eta_min is already floored at -1 by _fetch_stop's filter (nothing more
+    # stale survives), so a plain ascending sort is correct - a -1 means
+    # "due/arriving now" and belongs near the top, not pushed to the bottom.
+    all_buses.sort(key=lambda b: b["eta_min"])
 
     new_state = {
         "ok": True,
