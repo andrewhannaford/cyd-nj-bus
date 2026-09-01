@@ -272,7 +272,13 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   } else {
     snprintf(etaBuf, sizeof(etaBuf), "%d min", bus.etaMin);
   }
+  // "Delayed" is wider than the reserved ETA column at 12pt (unlike "Due"
+  // or "N min") and was overrunning into the destination text - measure
+  // it and drop to a smaller size rather than assuming a fixed budget.
   g.setFreeFont(&FreeSansBold12pt7b);
+  if (g.textWidth(etaBuf) > ETA_COL_W) {
+    g.setFreeFont(&FreeSansBold9pt7b);
+  }
   g.setTextColor(statusColor(bus.secLate, ink), bg);
   g.setTextDatum(MR_DATUM);
   g.drawString(etaBuf, ETA_RIGHT, cy);
