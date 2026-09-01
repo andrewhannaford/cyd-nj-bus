@@ -229,9 +229,15 @@ def _fetch_stop(stop_id, now, rt_updates):
     for trip in trips:
         route = (trip.get("public_route") or "").strip()
         dest = re.sub(r"\s+", " ", (trip.get("header") or "")).strip()
-        # "158 NEW YORK VIA RIVER ROAD" -> "NEW YORK VIA RIVER ROAD"; the
-        # board shows the route on its own badge, so the prefix just eats width.
-        dest = re.sub(r"^" + re.escape(route) + r"[A-Z]?\s+", "", dest)
+        # "159R NEW YORK VIA RIVER ROAD" -> "NEW YORK VIA RIVER ROAD"; the
+        # board shows the route on its own badge, so the prefix just eats
+        # width. public_route omits branch-variant suffixes like the "R" in
+        # "159R" (matches the app) - recover it from the header before
+        # stripping, or the variant gets lost outright instead of relocated.
+        variant_m = re.match(r"^" + re.escape(route) + r"([A-Z]?)\s+", dest)
+        if variant_m and variant_m.group(1):
+            route += variant_m.group(1)
+        dest = re.sub(r"^" + re.escape(route) + r"\s+", "", dest)
 
         remarks = _sentinel(trip.get("remarks")) or ""
         # "departurestatus" (e.g. "in 13 mins") only appears once a vehicle
@@ -241,15 +247,18 @@ def _fetch_stop(stop_id, now, rt_updates):
         delayed = "delay" in remarks.lower() or "delay" in status.lower()
 
         eta_min = None
+        sched_dt = None
         sched_raw = _sentinel(trip.get("sched_dep_time"))
         if sched_raw:
             try:
                 sched_dt = datetime.strptime(sched_raw, SCHED_TIME_FMT).replace(tzinfo=TZ)
                 eta_min = round((sched_dt - now).total_seconds() / 60)
             except ValueError:
+                sched_dt = None
                 eta_min = None
 
         m = ETA_MIN_RE.search(status)
+        live_tracked = bool(m) or "due" in status.lower() or delayed
         if m:
             eta_min = int(m.group(1))
         elif "due" in status.lower() and eta_min is None:
@@ -264,9 +273,16 @@ def _fetch_stop(stop_id, now, rt_updates):
         if eta_min < 0 and not delayed:
             eta_min = 0
 
-        # %-I (no leading zero) is a glibc extension, not portable - format
-        # normally and strip a leading zero instead.
-        eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
+        # The app shows NJT's own scheduled departure time here, not a time
+        # re-derived from the live countdown - the two can legitimately
+        # differ (that's what the countdown is for), and re-deriving it from
+        # now+eta_min drifts further every poll instead of matching NJT's
+        # own reference value. %-I (no leading zero) is a glibc extension,
+        # not portable - format normally and strip a leading zero instead.
+        if sched_dt is not None:
+            eta_time = sched_dt.strftime("%I:%M %p").lstrip("0")
+        else:
+            eta_time = (now + timedelta(minutes=eta_min)).strftime("%I:%M %p").lstrip("0")
 
         vehicle_id = _sentinel(trip.get("vehicle_id"))
         bus = {
@@ -275,7 +291,10 @@ def _fetch_stop(stop_id, now, rt_updates):
             "eta_min": eta_min,
             "eta_time": eta_time,
             "sec_late": DELAYED_SEC_LATE if delayed else 0,
-            "realtime": vehicle_id is not None,
+            # A live countdown (departurestatus) means NJT is actively
+            # tracking this trip, whether or not it also gave us a vehicle
+            # number - the two are independent fields, not the same signal.
+            "realtime": live_tracked,
             "vehicle_id": vehicle_id,
             "occupancy": _occupancy_level(trip.get("passload")),
         }
@@ -298,7 +317,13 @@ def _fetch_stop(stop_id, now, rt_updates):
         if not lookup:
             continue  # no cached static metadata for this trip yet - skip rather than show a blank route
         route = lookup["route"]
-        header = re.sub(r"^" + re.escape(route) + r"[A-Z]?\s+", "", lookup["header"])
+        header = lookup["header"]
+        # Recover a branch-variant suffix (e.g. "159R") the same way as the
+        # BUSDV2 path above - route_id alone omits it.
+        variant_m = re.match(r"^" + re.escape(route) + r"([A-Z]?)\s+", header)
+        if variant_m and variant_m.group(1):
+            route += variant_m.group(1)
+        header = re.sub(r"^" + re.escape(route) + r"\s+", "", header)
         buses_by_trip[trip_id] = {
             "route": route,
             "header": header,
@@ -313,8 +338,13 @@ def _fetch_stop(stop_id, now, rt_updates):
     # Schedule-only trips (no live vehicle/prediction) are frequently wrong -
     # NJT's own schedule adherence is loose enough that "45 min" often never
     # shows. Only trips actively tracked (BUSDV2 vehicle_id or a GTFS-RT
-    # prediction) are trustworthy enough to put on the board.
-    buses = [b for b in buses_by_trip.values() if b["realtime"]]
+    # prediction) are trustworthy enough to put on the board. Also drop
+    # trips more than a minute in the past - a "delayed" bus can run a
+    # little behind its predicted time, but a large negative eta_min is a
+    # stale prediction for a trip that's already come and gone, not a real
+    # upcoming arrival (seen repeatedly in GTFS-RT for trips that haven't
+    # aged out of the feed yet).
+    buses = [b for b in buses_by_trip.values() if b["realtime"] and b["eta_min"] >= -1]
     return stop_name, buses
 
 

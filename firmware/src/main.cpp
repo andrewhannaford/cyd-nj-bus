@@ -249,12 +249,18 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
   }
   g.drawString(dest, DEST_X, destY);
 
-  // Sub-line: just the arrival clock time (no vehicle #) + congestion
+  // Matches the app's own convention: a delayed bus swaps the sub-line to
+  // the literal word "Delayed" and puts the absolute clock time where the
+  // countdown normally goes on the right - the countdown isn't trustworthy
+  // once a trip is already flagged delayed.
+  bool isDelayed = bus.secLate >= LATE_CRIT_S;
+
+  // Sub-line: normally the arrival clock time (no vehicle #) + congestion
   // icons right after it, both in the middle column.
   g.setFreeFont(&FreeSans9pt7b);
   g.setTextColor(ink, bg);
   g.setTextDatum(ML_DATUM);
-  String subLine = bus.etaTime;
+  String subLine = isDelayed ? "Delayed" : bus.etaTime;
   while (subLine.length() > 0 && g.textWidth(subLine) > DEST_MAX_W) {
     subLine = subLine.substring(0, subLine.length() - 1);
   }
@@ -267,23 +273,21 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
 
   // ETA, right-aligned and vertically centered on the whole row.
   char etaBuf[10];
-  if (bus.etaMin < 0) {
-    snprintf(etaBuf, sizeof(etaBuf), "Delayed");
-  } else if (bus.etaMin == 0) {
+  if (isDelayed) {
+    snprintf(etaBuf, sizeof(etaBuf), "%s", bus.etaTime.c_str());
+  } else if (bus.etaMin <= 0) {
     snprintf(etaBuf, sizeof(etaBuf), "Due");
   } else {
     snprintf(etaBuf, sizeof(etaBuf), "%d min", bus.etaMin);
   }
-  // "Delayed" is wider than the reserved ETA column at 12pt (unlike "Due"
-  // or "N min") and was overrunning into the destination text - measure
-  // it and drop to a smaller size rather than assuming a fixed budget.
   g.setFreeFont(&FreeSansBold12pt7b);
   if (g.textWidth(etaBuf) > ETA_COL_W) {
     g.setFreeFont(&FreeSansBold9pt7b);
   }
-  // Red-on-navy was hard to read for "Delayed" specifically - keep the
-  // ink color there instead of the lateness color-coding.
-  g.setTextColor(bus.etaMin < 0 ? ink : statusColor(bus.secLate, ink), bg);
+  // Red-on-navy was hard to read specifically for the word "Delayed" - now
+  // that "Delayed" lives in the center, keep ink here too for the same
+  // delayed row rather than reintroducing that contrast problem.
+  g.setTextColor(isDelayed ? ink : statusColor(bus.secLate, ink), bg);
   g.setTextDatum(MR_DATUM);
   g.drawString(etaBuf, ETA_RIGHT, cy);
 }
