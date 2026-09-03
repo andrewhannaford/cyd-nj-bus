@@ -63,15 +63,15 @@ bool busEqual(const BusEntry &a, const BusEntry &b) {
 // Same two-tone zebra and #004f99/#00416d NJT blues as the app screenshot,
 // just with the "white" row swapped for near-black + white ink instead of
 // white + navy ink - keeps the alternating-row readability, easier at night.
-#define COL_PAGE     0x0861  // #0d0d0d - page plane / even-row background
-#define COL_HEADER   0x0273  // #004f99 - header bar (NJT blue, unchanged)
+#define COL_PAGE     0x0000  // #000000 - page plane / even-row background
+#define COL_HEADER   0x00E7  // #001f3f - header bar, darkened further from #003366
 #define COL_INK      0xFFFF  // #ffffff - ink on the near-black row
-#define COL_ALT_BG   0x020D  // #00416d - odd-row (alternating) background, NJT navy
+#define COL_ALT_BG   0x00E7  // #001f3f - odd-row (alternating) background, matched to COL_HEADER
 #define COL_ALT_INK  0xFFFF  // #ffffff - ink on the navy row
-#define COL_MUTED    0x8C30  // #898781 - muted text (header eyebrow only)
-#define COL_WARNING  0xFD83  // #fab219 - a few minutes late
-#define COL_CRITICAL 0xD1C7  // #d03b3b - significantly late / delayed
-#define COL_GOOD     0x0540  // #00aa00 - "LIVE" status pill (sampled from the app's occupancy green)
+#define COL_MUTED    0x4A48  // #4a4844 - muted text (header eyebrow only), darkened further from #6e6c67
+#define COL_WARNING  0xBC01  // #b8830f - a few minutes late, darkened further from #e0a015
+#define COL_CRITICAL 0x9124  // #952424 - significantly late / delayed, darkened further from #b83030
+#define COL_GOOD     0x0380  // #007000 - "LIVE" status pill, darkened further from #009000
 
 // ---------- layout ----------
 static const int SCREEN_W = 320;
@@ -282,9 +282,7 @@ void renderRow(TFT_eSPI &g, int top, const BusEntry &bus, bool alt) {
     int badgeMaxW = (ETA_RIGHT - ETA_COL_W) - badgeX - 2;
     String badge = "Scheduled";
     if (g.textWidth(badge) > badgeMaxW) badge = "Sched";
-    g.setTextColor(COL_MUTED, bg);
     g.drawString(badge, badgeX, subY);
-    g.setTextColor(ink, bg);
   } else if (bus.occupancy > 0) {
     drawOccupancy(g, badgeX, subY, bus.occupancy);
   }
